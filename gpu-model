@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# gpu-model — discover, serve, snapshot, and restore llama.cpp models
+# https://github.com/krassi/gpu-model
+set -uo pipefail
+
+VERSION="0.1.0"
+
+# ---------------- config ----------------
+# Sourced first so a config file can override any default below.
+for _cfg in /etc/gpu-model/config "${XDG_CONFIG_HOME:-$HOME/.config}/gpu-model/config"; do
+  [ -r "$_cfg" ] && . "$_cfg"
+done
+
+LLAMA_BIN="${LLAMA_BIN:-/home/ghost/llama.cpp/build/bin}"
+: "${GPU_MODEL_DIRS:=/STORAGE/huggingface $HOME/.cache/huggingface $HOME/models}"
+STATE_DIR="${GPU_MODEL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gpu-model}"
+INST_DIR="$STATE_DIR/instances"
+LOG_DIR="$STATE_DIR/logs"
+mkdir -p "$INST_DIR" "$LOG_DIR"
+
+_have() { command -v "$1" >/dev/null 2>&1; }
+_die()  { echo "gpu-model: $*" >&2; exit 1; }
+
+for _dep in python3 curl; do _have "$_dep" || _die "missing dependency: $_dep"; done
+[ -x "$LLAMA_BIN/llama-server" ] || echo "gpu-model: warning: $LLAMA_BIN/llama-server not found (set LLAMA_BIN)" >&2
+
+# ---------------- model discovery ----------------
+_gm_find() {                       # all loadable .gguf (follows HF symlinks, hides split parts>1)
+  local d
+  for d in $GPU_MODEL_DIRS; do
+    [ -d "$d" ] && find -L "$d" -type f -name '*.gguf' 2>/dev/null
+  done | grep -vE '\-0000[2-9]-of-|\-000[1-9][0-9]-of-'
+}
+
+_gm_resolve() {                    # $1=name (with/without .gguf) -> full path, or error
+  local q="${1%.gguf}" matches n
+  matches=$(_gm_find | awk -v q="$q.gguf" -F/ '$NF==q')
+  [ -z "$matches" ] && matches=$(_gm_find | grep -iF "$q")
+  n=$(grep -c . <<<"$matches"); [ -z "$matches" ] && n=0
+  if   (( n == 0 )); then echo "no model matching '$1' (try: gpu-model list)" >&2; return 1
+  elif (( n > 1 )); then echo "ambiguous '$1':" >&2; sed 's|.*/||' <<<"$matches" | sort -u >&2; return 1
+  fi
+  head -1 <<<"$matches"
+}
+
+_gm_free_port() {                  # first free port at/after $1
+  local p="${1:-8080}"
+  if _have ss; then
+    while ss -ltn 2>/dev/null | grep -q ":$p "; do p=$((p+1)); done
+  fi
+  echo "$p"
+}
+
+_gm_field() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["models"][int(sys.argv[2])][sys.argv[3]])' "$1" "$2" "$3"; }
+
+_gm_alive() {                      # echo alive instance files, prune dead ones
+  local f pid
+  for f in "$INST_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    pid=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["pid"])' "$f" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "$f"; else rm -f "$f"; fi
+  done
+}
+
+# ---------------- load a model into memory (background server) ----------------
+_gm_load() {
+  local name device=gpu slots=1 ctx=8192 port=""; local -a extra=()
+  name="${1:-}"; [ -n "$name" ] || _die "usage: gpu-model load <name> [--device gpu|cpu] [--slots N] [--ctx N] [--port P] [-- extra...]"
+  shift
+  while (( $# )); do case "$1" in
+    --device)           device="$2"; shift 2;;
+    --slots|--parallel) slots="$2";  shift 2;;
+    --ctx|--ctx-size)   ctx="$2";    shift 2;;
+    --port)             port="$2";   shift 2;;
+    --)                 shift; extra=("$@"); break;;
+    *)                  extra+=("$1"); shift;;
+  esac; done
+  case "$device" in gpu|cpu) ;; *) _die "--device must be gpu or cpu";; esac
+
+  local path; path=$(_gm_resolve "$name") || return 1
+  [ -z "$port" ] && port=$(_gm_free_port 8080)
+
+  local -a args=(-m "$path" --host 0.0.0.0 --port "$port" --parallel "$slots" --ctx-size "$ctx")
+  if [ "$device" = gpu ]; then
+    args+=(-ngl 99 --flash-attn auto --cache-type-k q8_0 --cache-type-v q8_0)
+  else
+    args+=(-ngl 0 -t "$(nproc)")
+  fi
+  (( ${#extra[@]} )) && args+=("${extra[@]}")
+
+  local log="$LOG_DIR/$(basename "${path%.gguf}")-$port.log"
+  echo ">> loading $(basename "$path")  device=$device port=$port slots=$slots ctx=$ctx"
+  nohup "$LLAMA_BIN/llama-server" "${args[@]}" >"$log" 2>&1 &
+  local pid=$!
+
+  python3 - "$INST_DIR" "$name" "$path" "$device" "$slots" "$ctx" "$port" "$pid" "${extra[@]}" <<'PY'
+import json,sys,time,os
+d,name,path,device,slots,ctx,port,pid=sys.argv[1:9]; extra=sys.argv[9:]
+rec=dict(name=name,path=path,device=device,slots=int(slots),ctx=int(ctx),
+         port=int(port),pid=int(pid),extra=extra,started=int(time.time()))
+open(os.path.join(d,port+".json"),"w").write(json.dumps(rec,indent=2))
+PY
+
+  local i
+  for i in $(seq 1 90); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "   FAILED to start — last log lines:" >&2; tail -n 15 "$log" >&2
+      rm -f "$INST_DIR/$port.json"; return 1
+    fi
+    if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
+      echo "   ready: http://localhost:$port/v1  (pid $pid, log $log)"; return 0
+    fi
+    sleep 2
+  done
+  echo "   started (pid $pid) but not healthy yet — check $log"
+}
+
+# ---------------- interactive one-shot ----------------
+_gm_run() {
+  local name="${1:-}"; [ -n "$name" ] || _die "usage: gpu-model run <name> [extra...]"
+  shift
+  local path; path=$(_gm_resolve "$name") || return 1
+  "$LLAMA_BIN/llama-cli" -m "$path" -ngl 99 --flash-attn auto --ctx-size 8192 --jinja -cnv "$@"
+}
+
+# ---------------- introspection / control ----------------
+_gm_list() {
+  printf '%-72s %s\n' MODEL SIZE
+  _gm_find | sort -u | while read -r f; do
+    printf '%-72s %s\n' "$(basename "$f")" "$(du -hL "$f" 2>/dev/null | cut -f1)"
+  done
+}
+
+_gm_ps() {
+  printf '%-6s %-7s %-6s %-8s %-8s %s\n' PORT DEVICE SLOTS CTX PID MODEL
+  local f
+  for f in $(_gm_alive); do
+    python3 - "$f" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1]))
+print("%-6s %-7s %-6s %-8s %-8s %s"%(r["port"],r["device"],r["slots"],r["ctx"],r["pid"],r["name"]))
+PY
+  done
+}
+
+_gm_stop() {
+  local target="${1:-}"; [ -n "$target" ] || _die "usage: gpu-model stop <port|name|all>"
+  local f port name pid
+  for f in $(_gm_alive); do
+    read -r port name pid < <(python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));print(r["port"],r["name"],r["pid"])' "$f")
+    if [ "$target" = all ] || [ "$target" = "$port" ] || [[ "$name" == *"$target"* ]]; then
+      kill "$pid" 2>/dev/null && echo "stopped $name (port $port, pid $pid)"; rm -f "$f"
+    fi
+  done
+}
+
+_gm_save() {
+  local out="${1:-}"; [ -n "$out" ] || _die "usage: gpu-model save <file.json>"
+  _gm_alive >/dev/null                       # prune dead first
+  python3 - "$out" "$INST_DIR" <<'PY'
+import json,sys,os,glob
+out,inst=sys.argv[1:3]; models=[]
+for f in sorted(glob.glob(os.path.join(inst,"*.json"))):
+    r=json.load(open(f))
+    models.append({k:r[k] for k in ("name","device","slots","ctx","port","extra")})
+json.dump({"models":models},open(out,"w"),indent=2)
+print("saved %d model(s) -> %s"%(len(models),out))
+PY
+}
+
+_gm_restore() {
+  local in="${1:-}"; [ -n "$in" ] || _die "usage: gpu-model restore <file.json>"
+  [ -r "$in" ] || _die "cannot read $in"
+  local n i
+  n=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["models"]))' "$in")
+  for ((i=0;i<n;i++)); do
+    local name device slots ctx port; local -a extra=()
+    name=$(_gm_field "$in" "$i" name);   device=$(_gm_field "$in" "$i" device)
+    slots=$(_gm_field "$in" "$i" slots); ctx=$(_gm_field "$in" "$i" ctx)
+    port=$(_gm_field "$in" "$i" port)
+    mapfile -t extra < <(python3 -c 'import json,sys;[print(x) for x in json.load(open(sys.argv[1]))["models"][int(sys.argv[2])].get("extra",[])]' "$in" "$i")
+    _gm_load "$name" --device "$device" --slots "$slots" --ctx "$ctx" --port "$port" -- "${extra[@]}"
+  done
+}
+
+_gm_usage() {
+  cat <<EOF
+gpu-model $VERSION — serve & snapshot llama.cpp models
+  gpu-model list                      list discoverable .gguf files (+ sizes)
+  gpu-model load <name> [opts]        load a model into memory (background server)
+        --device gpu|cpu   default gpu   (gpu = -ngl 99 +FA +q8 KV; cpu = -ngl 0)
+        --slots N          parallel slots, default 1
+        --ctx N            total context window, default 8192
+        --port P           default: next free from 8080
+        -- <extra args>    passed straight to llama-server
+  gpu-model run <name> [extra]        interactive one-shot chat
+  gpu-model ps                        show currently loaded models
+  gpu-model stop <port|name|all>      stop a running model
+  gpu-model save <file.json>          snapshot what's loaded to JSON
+  gpu-model restore <file.json>       recreate that state from JSON
+EOF
+}
+
+# ---------------- dispatch ----------------
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  list)              _gm_list;;
+  load)              _gm_load "$@";;
+  run)               _gm_run "$@";;
+  ps)                _gm_ps;;
+  stop)              _gm_stop "$@";;
+  save)              _gm_save "$@";;
+  restore)           _gm_restore "$@";;
+  -V|--version)      echo "gpu-model $VERSION";;
+  help|-h|--help)    _gm_usage;;
+  *)                 echo "gpu-model: unknown command '$cmd'" >&2; _gm_usage; exit 1;;
+esac

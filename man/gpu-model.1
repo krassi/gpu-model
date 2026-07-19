@@ -1,0 +1,90 @@
+.TH GPU-MODEL 1 "July 2026" "gpu-model 0.1.0" "User Commands"
+.SH NAME
+gpu-model \- discover, serve, snapshot, and restore llama.cpp models
+.SH SYNOPSIS
+.B gpu-model
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B gpu-model
+discovers GGUF model files on disk and manages
+.BR llama-server (1)
+instances built from llama.cpp. It can load a model into memory as a
+persistent background server with a configurable number of parallel
+slots, context window, and GPU or CPU placement, list running models,
+and snapshot or restore the whole running set from a JSON file.
+.SH COMMANDS
+.TP
+.B list
+List all discoverable \fB.gguf\fR files with their on-disk sizes.
+Discovery follows Hugging Face cache symlinks and hides secondary
+parts of split models.
+.TP
+.B load \fIname\fR [\fIoptions\fR]
+Load a model into memory as a background \fBllama-server\fR. \fIname\fR
+may be given with or without the \fB.gguf\fR suffix and is matched
+first exactly, then as a case-insensitive substring.
+.TP
+.B run \fIname\fR [\fIextra\fR]
+Start an interactive one-shot chat session with \fBllama-cli\fR.
+.TP
+.B ps
+Show currently loaded models (port, device, slots, context, pid, name).
+.TP
+.B stop \fIport\fR|\fIname\fR|all
+Stop a running model by port, name substring, or all of them.
+.TP
+.B save \fIfile.json\fR
+Write the set of currently loaded models to a JSON file.
+.TP
+.B restore \fIfile.json\fR
+Recreate the models described in a JSON file. Each model is
+re-resolved by name, so a restore still works if the underlying path
+changed (for example after a Hugging Face snapshot update).
+.SH LOAD OPTIONS
+.TP
+.B \-\-device gpu|cpu
+Placement. \fBgpu\fR uses full GPU offload with flash attention and
+q8_0 KV cache; \fBcpu\fR keeps the model on the CPU. Default \fBgpu\fR.
+.TP
+.B \-\-slots \fIN\fR
+Number of parallel slots (context is divided across them). Default 1.
+.TP
+.B \-\-ctx \fIN\fR
+Total context window in tokens. Default 8192.
+.TP
+.B \-\-port \fIP\fR
+Listen port. Default: next free port from 8080.
+.TP
+.B \-\- \fIextra...\fR
+Everything after \fB\-\-\fR is passed straight to \fBllama-server\fR.
+.SH FILES
+.TP
+.I /etc/gpu-model/config
+System-wide configuration (sourced as shell).
+.TP
+.I ~/.config/gpu-model/config
+Per-user configuration.
+.TP
+.I ~/.local/state/gpu-model/
+Instance metadata and server logs.
+.SH ENVIRONMENT
+.TP
+.B LLAMA_BIN
+Directory containing \fBllama-server\fR and \fBllama-cli\fR.
+.TP
+.B GPU_MODEL_DIRS
+Space-separated list of directories scanned for \fB.gguf\fR files.
+.SH EXAMPLES
+.nf
+gpu-model list
+gpu-model load qwen3-coder --device gpu --slots 4 --ctx 32768
+gpu-model load Foundation-Sec-8B-Instruct --device cpu
+gpu-model save ~/stacks/dev.json
+gpu-model restore ~/stacks/dev.json
+.fi
+.SH SEE ALSO
+.BR llama-server (1),
+.BR llama-cli (1)
+.SH AUTHOR
+krassi <krassi@gmail.com>
